@@ -37,6 +37,7 @@ export async function deployWorker(
   const deployToml = `name = "${options.workerName}"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 account_id = "${options.accountId}"
 
@@ -68,7 +69,23 @@ crons = ["*/5 * * * *"]
   buildSpinner.start("Worker ビルド中...");
   try {
     // Build workspace dependencies that the worker needs
-    await execa("npx", ["pnpm", "-r", "--filter", "./packages/shared", "--filter", "./packages/line-sdk", "--filter", "./packages/db", "build"], { cwd: options.repoDir });
+    await execa(
+      "npx",
+      [
+        "pnpm",
+        "-r",
+        "--filter",
+        "./packages/shared",
+        "--filter",
+        "./packages/line-sdk",
+        "--filter",
+        "./packages/db",
+        "--filter",
+        "./packages/update-engine",
+        "build",
+      ],
+      { cwd: options.repoDir },
+    );
     await execa("npx", ["vite", "build"], { cwd: workerDir });
     buildSpinner.stop("Worker ビルド完了");
 
