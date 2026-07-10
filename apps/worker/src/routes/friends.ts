@@ -8,14 +8,139 @@ import {
   getFriendTags,
   getScenarios,
   enrollFriendInScenario,
+  upsertFriend,
   jstNow,
 } from '@line-crm/db';
 import type { Friend as DbFriend, Tag as DbTag } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage } from '../services/step-delivery.js';
+import { requireRole } from '../middleware/role-guard.js';
 import type { Env } from '../index.js';
 
 const friends = new Hono<Env>();
+
+/**
+ * POST /api/friends/import-csv — bulk-register existing friends from a CSV
+ * export (e.g. migrating off another tool like エルメ/L Message).
+ *
+ * WHY THIS EXISTS: the webhook only creates a friend row on a `follow` event
+ * (see routes/webhook.ts). Anyone who was already following before the
+ * webhook was connected is invisible to L Harness — their future messages
+ * are silently dropped (`if (!friend) return;`) because there's no row to
+ * match against. This endpoint backfills those rows ahead of time so their
+ * messages resolve correctly once Webhook is switched over.
+ *
+ * Body: { lineAccountId: string, csv: string, tagNames?: string[] }
+ * CSV must have a header row and a `line_user_id` column (U... LINE user
+ * id). Optional columns: `display_name`. Optional `tagNames` (applied to
+ * every imported row) must reference existing tag names — this endpoint
+ * does not create tags.
+ *
+ * Idempotent: re-running with the same rows just upserts (no duplicates),
+ * since friends.line_user_id is UNIQUE.
+ *
+ * requireRole('owner', 'admin') — this writes production friend data in
+ * bulk, so it's gated the same way as other account-admin operations.
+ */
+friends.post('/api/friends/import-csv', requireRole('owner', 'admin'), async (c) => {
+  try {
+    const body = await c.req.json<{ lineAccountId?: string; csv?: string; tagNames?: string[] }>();
+    if (!body.lineAccountId) {
+      return c.json({ success: false, error: 'lineAccountId is required' }, 400);
+    }
+    if (!body.csv || typeof body.csv !== 'string' || body.csv.trim().length === 0) {
+      return c.json({ success: false, error: 'csv is required' }, 400);
+    }
+
+    // Minimal RFC4180-ish CSV parser: handles quoted fields with embedded
+    // commas, but not embedded newlines inside quotes (not needed for a
+    // simple line_user_id/display_name export).
+    function parseCsvLine(line: string): string[] {
+      const out: string[] = [];
+      let cur = '';
+      let inQuotes = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (inQuotes) {
+          if (ch === '"') {
+            if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+          } else {
+            cur += ch;
+          }
+        } else if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === ',') {
+          out.push(cur);
+          cur = '';
+        } else {
+          cur += ch;
+        }
+      }
+      out.push(cur);
+      return out.map((s) => s.trim());
+    }
+
+    const lines = body.csv.split(/\r\n|\n|\r/).filter((l) => l.length > 0);
+    if (lines.length < 2) {
+      return c.json({ success: false, error: 'csv must have a header row plus at least one data row' }, 400);
+    }
+    const header = parseCsvLine(lines[0]).map((h) => h.toLowerCase());
+    const idIdx = header.indexOf('line_user_id');
+    if (idIdx === -1) {
+      return c.json({ success: false, error: 'csv header must include a "line_user_id" column' }, 400);
+    }
+    const nameIdx = header.indexOf('display_name');
+
+    // Resolve tagNames -> tag ids up front (fail fast on unknown tag names
+    // rather than partway through a 900-row import).
+    let tagIds: string[] = [];
+    if (body.tagNames && body.tagNames.length > 0) {
+      for (const name of body.tagNames) {
+        const row = await c.env.DB.prepare(`SELECT id FROM tags WHERE name = ?`).bind(name).first<{ id: string }>();
+        if (!row) return c.json({ success: false, error: `tag "${name}" does not exist — create it first` }, 400);
+        tagIds.push(row.id);
+      }
+    }
+
+    let created = 0;
+    let updated = 0;
+    const errors: { row: number; error: string }[] = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCsvLine(lines[i]);
+      const lineUserId = cols[idIdx];
+      if (!lineUserId || !lineUserId.startsWith('U')) {
+        errors.push({ row: i + 1, error: `missing/invalid line_user_id: "${lineUserId ?? ''}"` });
+        continue;
+      }
+      try {
+        const before = await c.env.DB.prepare(`SELECT id FROM friends WHERE line_user_id = ?`).bind(lineUserId).first<{ id: string }>();
+        const friend = await upsertFriend(c.env.DB, {
+          lineUserId,
+          displayName: nameIdx !== -1 ? (cols[nameIdx] || null) : null,
+        });
+        // upsertFriend doesn't touch line_account_id — set it only on first
+        // insert so we don't clobber an account assignment on re-import.
+        if (!before) {
+          await c.env.DB.prepare(`UPDATE friends SET line_account_id = ? WHERE id = ?`).bind(body.lineAccountId, friend.id).run();
+          created++;
+        } else {
+          updated++;
+        }
+        for (const tagId of tagIds) {
+          await addTagToFriend(c.env.DB, friend.id, tagId);
+        }
+      } catch (err) {
+        errors.push({ row: i + 1, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    return c.json({ success: true, data: { created, updated, errorCount: errors.length, errors: errors.slice(0, 20) } });
+  } catch (err) {
+    console.error('POST /api/friends/import-csv error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
 
 /**
  * Convert a D1 snake_case Friend row to the shared camelCase shape.
@@ -86,32 +211,14 @@ friends.get('/api/friends', async (c) => {
     const tagId = c.req.query('tagId');
     const lineAccountId = c.req.query('lineAccountId');
     const search = c.req.query('search');
-    // ?includeTags=false skips per-row tag enrichment (N+1 of getFriendTags
-    // → ~50 extra D1 reads on a wide list query). The list view needs tags
-    // for filter chips, but autocomplete-style consumers (test-recipient
-    // picker, broadcast recipient picker) only render id/displayName/picture
-    // and pay the cost for nothing. Default true to keep the historical
-    // behavior for existing callers.
     const includeTags = c.req.query('includeTags') !== 'false';
-    // ?includeChatStatus=true — populate latestIncomingMessage,
-    // latestOutgoingAt, activeScenario, and a derived `handled` flag for
-    // each friend. Used by the L-step-style /friends listing; off by
-    // default to keep the simple list / autocomplete paths cheap.
     const includeChatStatus = c.req.query('includeChatStatus') === 'true';
-    // ?sort=oldest reverses default created_at DESC. Default = recent-first.
-    // Search mode (when `search` is set) overrides both — we keep the
-    // match-quality ranking and only flip the secondary `created_at` tier.
     const sort: 'recent' | 'oldest' = c.req.query('sort') === 'oldest' ? 'oldest' : 'recent';
-    // ?handled=unhandled filters to friends whose latest activity is an
-    // incoming message (mirroring the L-step "未対応" tab). Done in SQL so
-    // pagination + total counts are correct; client-side filter would only
-    // hide rows on the current page and leave `total` misleading.
     const handledFilter: 'unhandled' | null =
       c.req.query('handled') === 'unhandled' ? 'unhandled' : null;
 
     const db = c.env.DB;
 
-    // Build WHERE conditions
     const conditions: string[] = [];
     const binds: unknown[] = [];
     if (tagId) {
@@ -126,21 +233,7 @@ friends.get('/api/friends', async (c) => {
       conditions.push('f.display_name LIKE ?');
       binds.push(`%${search}%`);
     }
-    // Unhandled filter: chats.status === 'unread'.
-    //
-    // We derive 対応マーク from chats.status — the same model the /chats UI
-    // uses — instead of inferring from messages_log timestamps. Reasons:
-    //   - silent auto-replies / postbacks intentionally do NOT flip the
-    //     chat to unread (see webhook.ts), so a timestamp-based heuristic
-    //     would mark them as 未対応 against the operator's intent
-    //   - operators explicitly mark 対応済み (resolved) / 対応中 (in_progress)
-    //     via the chats UI, and that state must be honored here
-    //   - friends without any chat row default to 'resolved' (lazy-create
-    //     in chats.ts:88 also seeds with 'resolved'), matching the chats
-    //     listing's COALESCE(c.status, 'resolved') convention
     if (handledFilter === 'unhandled') {
-      // DESC mirrors the /api/chats listing — newest chat row wins so a
-      // resolved-then-reopened conversation correctly resurfaces as 未対応.
       conditions.push(
         `COALESCE(
            (SELECT status FROM chats c
@@ -150,7 +243,6 @@ friends.get('/api/friends', async (c) => {
          ) = 'unread'`,
       );
     }
-    // Metadata filters: ?metadata.key=value (e.g. ?metadata.monthly_cost=〜100万円)
     const url = new URL(c.req.url);
     for (const [key, value] of url.searchParams.entries()) {
       if (key.startsWith('metadata.')) {
@@ -165,30 +257,6 @@ friends.get('/api/friends', async (c) => {
     const totalRow = await (binds.length > 0 ? countStmt.bind(...binds) : countStmt).first<{ count: number }>();
     const total = totalRow?.count ?? 0;
 
-    // When `search` is present we want exact / prefix matches to surface
-    // first regardless of friend age. Plain `ORDER BY created_at DESC`
-    // pushes the most-likely candidate (e.g. the operator themselves,
-    // friended on day-one of the account) below recently-added friends
-    // whose displayName happens to contain the same substring. The
-    // CASE expression below ranks: exact (0) → prefix (1) → word-start (2)
-    // → generic substring (3), then created_at DESC inside each tier.
-    //
-    // - The exact tier uses `LIKE ?` (no wildcards) instead of `= ?` so
-    //   SQLite's ASCII case-insensitive `LIKE` lets `shu` match `Shu`.
-    //   Plain `=` is byte-exact and would relegate that row to tier 1
-    //   alongside `Shun` / `shuji`, defeating the rerank.
-    // - Word-start patterns include both ASCII space and full-width
-    //   so Japanese names like `山田　太郎` match on the second name part.
-    // The tracked_links JOIN + chats.status subselect are only needed when the
-    // caller requested chat status. Skipping them on autocomplete-style calls
-    // (?includeChatStatus omitted, includeTags=false) keeps a single keystroke
-    // cheap. List view enables it.
-    //
-    // chat_status subselect: the existing /api/chats listing pulls the
-    // **newest** chat row per friend (chats.ts:288 — `ORDER BY created_at DESC`).
-    // Operators can re-open a resolved chat, which inserts a new row; reading
-    // the oldest row would show stale 対応済み in those cases. We mirror the
-    // chats list's DESC convention here so the badge agrees with /chats.
     const baseSelect = includeChatStatus
       ? `f.*, tl.name AS first_tracked_link_name,
          COALESCE(
@@ -201,8 +269,6 @@ friends.get('/api/friends', async (c) => {
     const baseFrom = includeChatStatus
       ? `FROM friends f LEFT JOIN tracked_links tl ON tl.id = f.first_tracked_link_id`
       : `FROM friends f`;
-    // Secondary tier of the search-mode ORDER BY (after match_score) and the
-    // primary tier in non-search mode. Switched by ?sort=oldest|recent.
     const createdOrder = sort === 'oldest' ? 'ASC' : 'DESC';
     let listStmt;
     let listBinds: unknown[];
@@ -233,9 +299,6 @@ friends.get('/api/friends', async (c) => {
     const listResult = await listStmt.bind(...listBinds).all<DbFriend>();
     const items = listResult.results;
 
-    // Fetch tags for each friend in parallel so the list response includes tags.
-    // Skipped when ?includeTags=false (autocomplete consumers don't render
-    // tags and would otherwise pay N D1 reads per keystroke).
     let itemsWithTags = includeTags
       ? await Promise.all(
           items.map(async (friend) => {
@@ -245,10 +308,6 @@ friends.get('/api/friends', async (c) => {
         )
       : items.map((friend) => ({ ...serializeFriendListRow(friend, includeChatStatus), tags: [] }));
 
-    // Optional: hydrate chat status (latest in/out message, active scenario,
-    // derived "handled" flag). Three batched queries instead of N×3 to keep
-    // the request cheap even at limit=50. ROW_NUMBER() picks the freshest
-    // row per friend; SQLite supports window functions on D1.
     if (includeChatStatus && items.length > 0) {
       const ids = items.map((f) => f.id);
       const placeholders = ids.map(() => '?').join(',');
@@ -271,11 +330,6 @@ friends.get('/api/friends', async (c) => {
           .all<IncomingRow>(),
         db
           .prepare(
-            // delivery_type='test' は実顧客への配信ではない (テスト送信先への
-            // ブロードキャスト)。/api/chats など他のチャット系ビューも同じく
-            // test 配信を除外して "活動" を判定するので、そちらと整合させる。
-            // 含めると、テスト送信先に登録されたまま実 incoming を放置している
-            // 友だちの handled が誤って true に flip する事故が起きる。
             `SELECT friend_id, MAX(created_at) AS max_at FROM messages_log
              WHERE direction = 'outgoing'
                AND (delivery_type IS NULL OR delivery_type != 'test')
@@ -303,18 +357,11 @@ friends.get('/api/friends', async (c) => {
       const outgoingByFriend = new Map(outgoingRes.results.map((r) => [r.friend_id, r.max_at]));
       const scenarioByFriend = new Map(scenarioRes.results.map((r) => [r.friend_id, r]));
 
-      // We're inside `if (includeChatStatus)` so every row was emitted by
-      // serializeFriendListRow with chatStatus populated. TS can't narrow
-      // through the union, so assert the populated shape locally.
       type WithChatStatus = (typeof itemsWithTags)[number] & { chatStatus: 'unread' | 'in_progress' | 'resolved' };
       itemsWithTags = (itemsWithTags as WithChatStatus[]).map((f) => {
         const inc = incomingByFriend.get(f.id);
         const outAt = outgoingByFriend.get(f.id);
         const sc = scenarioByFriend.get(f.id);
-        // 対応済み判定は chats.status 一本。messages_log の出入り時刻ではなく、
-        // /chats 画面が見ている persisted state を使う。silent auto-reply や
-        // postback のように "incoming だが unread にしない" イベントもあるので、
-        // タイムスタンプベースで推測すると /chats と乖離する。
         const handled = f.chatStatus !== 'unread';
         return {
           ...f,
@@ -430,7 +477,6 @@ friends.post('/api/friends/:id/tags', async (c) => {
     const db = c.env.DB;
     await addTagToFriend(db, friendId, body.tagId);
 
-    // Enroll in tag_added scenarios that match this tag
     const allScenarios = await getScenarios(db);
     for (const scenario of allScenarios) {
       if (scenario.trigger_type === 'tag_added' && scenario.is_active && scenario.trigger_tag_id === body.tagId) {
@@ -444,7 +490,6 @@ friends.post('/api/friends/:id/tags', async (c) => {
       }
     }
 
-    // イベントバス発火: tag_change
     await fireEvent(db, 'tag_change', { friendId, eventData: { tagId: body.tagId, action: 'add' } });
 
     return c.json({ success: true, data: null }, 201);
@@ -462,7 +507,6 @@ friends.delete('/api/friends/:id/tags/:tagId', async (c) => {
 
     await removeTagFromFriend(c.env.DB, friendId, tagId);
 
-    // イベントバス発火: tag_change
     await fireEvent(c.env.DB, 'tag_change', { friendId, eventData: { tagId, action: 'remove' } });
 
     return c.json({ success: true, data: null });
@@ -513,11 +557,6 @@ friends.put('/api/friends/:id/metadata', async (c) => {
 friends.get('/api/friends/:id/messages', async (c) => {
   try {
     const friendId = c.req.param('id');
-    // Fetch the latest 200 messages (DESC) then reverse to ASC for display.
-    // Using ORDER BY ASC LIMIT 200 returns the OLDEST 200 rows, which silently
-    // hides recent activity for chatty friends. Exclude delivery_type='test'
-    // to stay consistent with /api/chats/:id, so the same friend shows the
-    // same history across DirectMessagePanel and the chat panel.
     const result = await c.env.DB
       .prepare(
         `SELECT id, direction, message_type as messageType, content, created_at as createdAt
@@ -555,7 +594,6 @@ friends.post('/api/friends/:id/messages', async (c) => {
     }
 
     const { LineClient } = await import('@line-crm/line-sdk');
-    // Resolve access token from friend's account (multi-account support)
     let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
     if ((friend as unknown as Record<string, unknown>).line_account_id) {
       const { getLineAccountById } = await import('@line-crm/db');
@@ -565,7 +603,6 @@ friends.post('/api/friends/:id/messages', async (c) => {
     const lineClient = new LineClient(accessToken);
     const messageType = body.messageType ?? 'text';
 
-    // Auto-wrap URLs with tracking links (text with URLs → Flex with button)
     const { autoTrackContent } = await import('../services/auto-track.js');
     const tracked = await autoTrackContent(
       db, messageType, body.content,
@@ -575,7 +612,6 @@ friends.post('/api/friends/:id/messages', async (c) => {
     const message = buildMessage(tracked.messageType, tracked.content, body.altText);
     await lineClient.pushMessage(friend.line_user_id, [message]);
 
-    // Log outgoing message
     const logId = crypto.randomUUID();
     await db
       .prepare(
