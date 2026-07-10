@@ -128,7 +128,6 @@ richMenus.post('/api/rich-menus/bulk-unlink', async (c) => {
     return c.json({ success: false, error: message }, 500);
   }
 });
-</parameter>
 // POST /api/friends/:friendId/rich-menu — link rich menu to a specific friend
 richMenus.post('/api/friends/:friendId/rich-menu', async (c) => {
   try {
