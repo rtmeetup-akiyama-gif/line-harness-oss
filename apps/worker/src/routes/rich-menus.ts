@@ -69,7 +69,66 @@ richMenus.post('/api/rich-menus/:id/default', async (c) => {
     return c.json({ success: false, error: `Failed to set default rich menu: ${message}` }, 500);
   }
 });
+// POST /api/rich-menus/bulk-unlink — clear individually-linked rich menus for
+// every follower on an account, so the account-wide default rich menu takes
+// effect for everyone.
+//
+// WHY THIS EXISTS: a friend can have a rich menu linked *directly to them*
+// (via linkRichMenuToUser), which LINE always prefers over the account-wide
+// default (setDefaultRichMenu). Migrating off another tool (e.g. エルメ) that
+// individually links a menu per-follower means our new default silently does
+// nothing for anyone who already has an individual link — the old menu (and
+// its old tap actions/message text) keeps showing. This endpoint uses LINE's
+// official bulk-unlink endpoint (POST /v2/bot/richmenu/bulk/unlink, max 500
+// user IDs per call) to clear those individual links account-wide; everyone
+// then falls back to whatever is currently set as the account default.
+// Safe/idempotent: unlinking a user with no individual link is a no-op on
+// LINE's side.
+richMenus.post('/api/rich-menus/bulk-unlink', async (c) => {
+  try {
+    const body = await c.req.json<{ accountId?: string }>();
+    if (!body.accountId) {
+      return c.json({ success: false, error: 'accountId is required' }, 400);
+    }
+    const account = await getLineAccountById(c.env.DB, body.accountId);
+    if (!account) {
+      return c.json({ success: false, error: 'line account not found' }, 404);
+    }
 
+    const result = await c.env.DB
+      .prepare(`SELECT line_user_id FROM friends WHERE line_account_id = ? AND is_following = 1`)
+      .bind(body.accountId)
+      .all<{ line_user_id: string }>();
+    const userIds = result.results.map((r) => r.line_user_id);
+
+    let unlinked = 0;
+    const errors: { chunk: number; error: string }[] = [];
+    const CHUNK_SIZE = 500; // LINE's max per bulk-unlink call
+    for (let i = 0; i < userIds.length; i += CHUNK_SIZE) {
+      const chunk = userIds.slice(i, i + CHUNK_SIZE);
+      const res = await fetch('https://api.line.me/v2/bot/richmenu/bulk/unlink', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${account.channel_access_token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ userIds: chunk }),
+      });
+      if (res.ok) {
+        unlinked += chunk.length;
+      } else {
+        errors.push({ chunk: i / CHUNK_SIZE + 1, error: `${res.status} ${await res.text()}` });
+      }
+    }
+
+    return c.json({ success: true, data: { totalFriends: userIds.length, unlinked, errorCount: errors.length, errors } });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('POST /api/rich-menus/bulk-unlink error:', message);
+    return c.json({ success: false, error: message }, 500);
+  }
+});
+</parameter>
 // POST /api/friends/:friendId/rich-menu — link rich menu to a specific friend
 richMenus.post('/api/friends/:friendId/rich-menu', async (c) => {
   try {
